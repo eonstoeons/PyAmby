@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PyAmby v1.0 — cosmic algorithmic ambient player + exporter
+PyAmby  — cosmic algorithmic ambient player + exporter
 Pure Python stdlib. No dependencies. Offline. Forever.
 MIT License · 2025 FREEFLOW Project
 """
@@ -19,17 +19,13 @@ CORE = r'''
 import json, math, os, random, struct, time, wave
 from pathlib import Path
 
-SR=44100;INV_SR=1/SR;TAU=math.tau;_PI=math.pi;NYQUIST=SR*.5
-# PERF: smaller chunk = lower latency, faster first-audio; 4s is sweet spot
-CHUNK=SR*4
+SR=44100;INV_SR=1/SR;TAU=math.tau;_PI=math.pi;NYQUIST=SR*.5;CHUNK=SR*10
 _sin=math.sin;_cos=math.cos;_exp=math.exp;_tanh=math.tanh
 _rand=random.random;_gauss=random.gauss;_uniform=random.uniform
-# Larger LUT = better quality, same speed
-_SIN_N=8192;_SIN_MASK=_SIN_N-1;_SIN_SCALE=_SIN_N/TAU
-_SIN_T=[math.sin(i*TAU/_SIN_N) for i in range(_SIN_N)]
+_SIN_N=4096;_SIN_T=[math.sin(i*TAU/_SIN_N) for i in range(_SIN_N)]
 def fast_sin(p):
-    q=p*_SIN_SCALE;i=int(q)&_SIN_MASK;f=q-int(q)
-    return _SIN_T[i]+(_SIN_T[(i+1)&_SIN_MASK]-_SIN_T[i])*f
+    q=(p%TAU)*(_SIN_N/TAU);i=int(q)&(_SIN_N-1);f=q-int(q)
+    return _SIN_T[i]+(_SIN_T[(i+1)&(_SIN_N-1)]-_SIN_T[i])*f
 QUALITY={"mobile":{"max_voices":4,"reverb_combs":4,"max_chimes":6,"bytebeat_sr":4000},
          "balanced":{"max_voices":12,"reverb_combs":6,"max_chimes":10,"bytebeat_sr":8000},
          "studio":{"max_voices":32,"reverb_combs":8,"max_chimes":12,"bytebeat_sr":8000}}
@@ -784,20 +780,6 @@ def master_proc(l,r,dcl,dcr,width,gain,drive):
     l=dcl.process(soft_clip(l,drive)*gain);r=dcr.process(soft_clip(r,drive)*gain)
     return clamp(l,-.999,.999),clamp(r,-.999,.999)
 
-# PERF: Use array module for fast PCM packing — 3-4x faster than struct loop
-_pack_buf=struct.pack
-def _frames_to_bytes(ls,rs):
-    n=len(ls);buf=bytearray(n*4)
-    for i in range(n):
-        lv=int(ls[i]*32767);rv=int(rs[i]*32767)
-        if lv>32767: lv=32767
-        elif lv<-32767: lv=-32767
-        if rv>32767: rv=32767
-        elif rv<-32767: rv=-32767
-        buf[i*4]  =lv&0xFF;buf[i*4+1]=(lv>>8)&0xFF
-        buf[i*4+2]=rv&0xFF;buf[i*4+3]=(rv>>8)&0xFF
-    return bytes(buf)
-
 def render_music(path,events,dur,mode,flags,vol,progress_cb):
     genre=apply_flags(GENRES.get(mode,GENRES["ambient"]),flags)
     rl=Reverb(size=genre["reverb_size"],damp=genre["reverb_damp"],mix=genre["reverb_mix"])
@@ -810,35 +792,28 @@ def render_music(path,events,dur,mode,flags,vol,progress_cb):
     wc=WindChimes(.25,.20) if "chimes" in flags else None
     lw=Wind(.15) if "nature" in flags else None
     lr=Rain(.20) if "nature" in flags else None
-    # PERF: pre-sort events; use pointer approach
     events=sorted(events,key=lambda e:e.time)
     total=int(dur*SR)+SR;ev_ptr=0;active=[]
     width=1.12
     if "wide" in flags: width=min(2.,width*1.35)
     if "narrow" in flags: width=max(.3,width*.65)
     mg=.88*max(0.,min(1.,vol));md=1.10;pm=-1
-    _PI_025=_PI*.25
     with wave.open(str(path),"wb") as w:
         w.setnchannels(2);w.setsampwidth(2);w.setframerate(SR)
         for cs in range(0,total,CHUNK):
-            ce=min(cs+CHUNK,total);n=ce-cs
-            frames=bytearray(n*4);fi=0
-            t_base=cs*INV_SR
-            for si in range(n):
-                t=t_base+si*INV_SR
-                # PERF: batch-advance event pointer
+            ce=min(cs+CHUNK,total);frames=bytearray((ce-cs)*4);fi=0
+            for i in range(cs,ce):
+                t=i*INV_SR
                 while ev_ptr<len(events) and events[ev_ptr].time<=t+.005:
                     active.append(events[ev_ptr]);ev_ptr+=1
                 sl=0.;sr_=0.;still=[]
                 for ev in active:
                     lt=t-ev.time
-                    expire=ev.duration+ev.env.r+1.2
-                    if lt>expire: continue
-                    still.append(ev)
-                    env_v=ev.env.get(lt,ev.duration)
+                    if lt>ev.duration+ev.env.r+1.2: continue
+                    still.append(ev);env_v=ev.env.get(lt,ev.duration)
                     if env_v<.00005: continue
                     v=(ev.engine.sample(lt,env_v) if ev.is_sub else ev.engine.sample(lt))*env_v*ev.vol
-                    pr=(ev.pan+1)*_PI_025;sl+=v*_cos(pr);sr_+=v*_sin(pr)
+                    pr=(ev.pan+1)*_PI*.25;sl+=v*_cos(pr);sr_+=v*_sin(pr)
                 active=still
                 if bl:  bv=bl.sample(t);sl+=bv;sr_+=bv
                 if wc:  cl2,cr2=wc.sample_stereo(t);sl+=cl2;sr_+=cr2
@@ -848,14 +823,7 @@ def render_music(path,events,dur,mode,flags,vol,progress_cb):
                 cl,cr=dl.process(cl,cr)
                 if vt: tx=vt.sample();cl+=tx;cr+=tx*(1+_uniform(-.20,.20))
                 cl,cr=master_proc(cl,cr,dcl,dcr,width,mg,md)
-                lv=int(cl*32767);rv=int(cr*32767)
-                if lv>32767: lv=32767
-                elif lv<-32767: lv=-32767
-                if rv>32767: rv=32767
-                elif rv<-32767: rv=-32767
-                frames[fi]  =lv&0xFF;frames[fi+1]=(lv>>8)&0xFF
-                frames[fi+2]=rv&0xFF;frames[fi+3]=(rv>>8)&0xFF
-                fi+=4
+                struct.pack_into("<hh",frames,fi,int(cl*32767),int(cr*32767));fi+=4
             w.writeframes(frames);pct=int((ce/total)*100)
             if pct!=pm:
                 if progress_cb: progress_cb(pct)
@@ -880,15 +848,12 @@ def render_pure(path,mode,dur,seed,flags,vol,progress_cb):
     width=1.12
     if "wide" in flags: width=min(2.,width*1.35)
     mg=.88*max(0.,min(1.,vol));md=1.10;pm=-1
-    _TAU200=TAU*200.*INV_SR
     with wave.open(str(path),"wb") as w:
         w.setnchannels(2);w.setsampwidth(2);w.setframerate(SR)
         for cs in range(0,total,CHUNK):
-            ce=min(cs+CHUNK,total);n=ce-cs
-            frames=bytearray(n*4);fi=0
-            t_base=cs*INV_SR
-            for si in range(n):
-                t=t_base+si*INV_SR;l=0.;r=0.
+            ce=min(cs+CHUNK,total);frames=bytearray((ce-cs)*4);fi=0
+            for i in range(cs,ce):
+                t=i*INV_SR;l=0.;r=0.
                 if wind:  wl,wr=wind.sample_stereo(t);l+=wl;r+=wr
                 if rain:  rl2,rr2=rain.sample_stereo(t);l+=rl2;r+=rr2
                 if ocean: ol,or_=ocean.sample_stereo(t);l+=ol;r+=or_
@@ -902,17 +867,10 @@ def render_pure(path,mode,dur,seed,flags,vol,progress_cb):
                 if chimes:cl2,cr2=chimes.sample_stereo(t);l+=cl2;r+=cr2
                 if bb_beat>0:
                     l+=fast_sin(bbp)*mx["binaural"]*.25;r+=fast_sin(bbp+TAU*bb_beat*t)*mx["binaural"]*.25
-                    bbp+=_TAU200
+                    bbp+=TAU*200.*INV_SR
                 l=rl.process(l);r=rr.process(r)
                 l,r=master_proc(l,r,dcl,dcr,width,mg,md)
-                lv=int(l*32767);rv=int(r*32767)
-                if lv>32767: lv=32767
-                elif lv<-32767: lv=-32767
-                if rv>32767: rv=32767
-                elif rv<-32767: rv=-32767
-                frames[fi]  =lv&0xFF;frames[fi+1]=(lv>>8)&0xFF
-                frames[fi+2]=rv&0xFF;frames[fi+3]=(rv>>8)&0xFF
-                fi+=4
+                struct.pack_into("<hh",frames,fi,int(l*32767),int(r*32767));fi+=4
             w.writeframes(frames);pct=int((ce/total)*100)
             if pct!=pm:
                 if progress_cb: progress_cb(pct)
@@ -928,21 +886,12 @@ def render_special(path,mode,dur,seed,flags,vol,progress_cb,entity_profile="moun
     with wave.open(str(path),"wb") as w:
         w.setnchannels(2);w.setsampwidth(2);w.setframerate(SR)
         for cs in range(0,total,CHUNK):
-            ce=min(cs+CHUNK,total);n=ce-cs
-            frames=bytearray(n*4);fi=0
-            t_base=cs*INV_SR
-            for si in range(n):
-                t=t_base+si*INV_SR;l,r=gen.sample_stereo(t)
+            ce=min(cs+CHUNK,total);frames=bytearray((ce-cs)*4);fi=0
+            for i in range(cs,ce):
+                t=i*INV_SR;l,r=gen.sample_stereo(t)
                 l=rl.process(l);r=rr.process(r)
                 l,r=master_proc(l,r,dcl,dcr,width,mg,md)
-                lv=int(l*32767);rv=int(r*32767)
-                if lv>32767: lv=32767
-                elif lv<-32767: lv=-32767
-                if rv>32767: rv=32767
-                elif rv<-32767: rv=-32767
-                frames[fi]  =lv&0xFF;frames[fi+1]=(lv>>8)&0xFF
-                frames[fi+2]=rv&0xFF;frames[fi+3]=(rv>>8)&0xFF
-                fi+=4
+                struct.pack_into("<hh",frames,fi,int(l*32767),int(r*32767));fi+=4
             w.writeframes(frames);pct=int((ce/total)*100)
             if pct!=pm:
                 if progress_cb: progress_cb(pct)
@@ -1001,12 +950,12 @@ def play_wav_blocking(path, stop_ev=None):
                 try: p.terminate()
                 except: pass
                 return
-            time.sleep(.05)
+            time.sleep(.08)
     def _tw():
         start=time.time()
         while time.time()-start<dur:
             if stop_ev and stop_ev.is_set(): return
-            time.sleep(.05)
+            time.sleep(.08)
     try:
         if sys.platform=='win32':
             try:
@@ -1018,7 +967,7 @@ def play_wav_blocking(path, stop_ev=None):
                         try: _ws.PlaySound(None,_ws.SND_PURGE)
                         except: pass
                         return
-                    time.sleep(.05)
+                    time.sleep(.08)
                 return
             except Exception: pass
             if shutil.which('powershell'):
@@ -1062,23 +1011,19 @@ _MOOD_POOL=['ethereal','ethereal','peaceful','peaceful','mysterious','melancholi
 class Engine:
     def __init__(self):
         self._playing=False; self._stop=threading.Event()
-        # PERF: queue size 3 — always have 1 playing + 1 ready + 1 rendering
-        self._q=queue.Queue(maxsize=3)
+        self._q=queue.Queue(maxsize=2)
         self._scb=None; self._pcb=None; self._playcb=None
         self._ns={}; self._loaded=False; self._tmp=None
         self._vol=1.0; self._fixed=None
-        self._load_lock=threading.Lock()
 
     def _load(self):
-        # PERF: thread-safe lazy load with lock
-        with self._load_lock:
-            if not self._loaded:
-                ns={'__name__':'pyamby_core','__file__':''}
-                exec(CORE,ns)
-                self._ns=ns; self._loaded=True
-            if self._tmp is None:
-                self._tmp=Path(tempfile.gettempdir())/'pyamby_chunks'
-                self._tmp.mkdir(exist_ok=True)
+        if not self._loaded:
+            ns={'__name__':'pyamby_core','__file__':''}
+            exec(CORE,ns)
+            self._ns=ns; self._loaded=True
+        if self._tmp is None:
+            self._tmp=Path(tempfile.gettempdir())/'pyamby_chunks'
+            self._tmp.mkdir(exist_ok=True)
 
     def set_cbs(self,s=None,p=None,play=None): self._scb=s;self._pcb=p;self._playcb=play
     def set_vol(self,v): self._vol=max(0.,min(1.,float(v)))
@@ -1092,14 +1037,12 @@ class Engine:
 
     def stop(self):
         self._playing=False; self._stop.set()
-        # PERF: drain queue quickly
-        for _ in range(self._q.maxsize+4):
+        for _ in range(self._q.qsize()+2):
             try:
                 p=self._q.get_nowait()
                 try: os.unlink(p)
                 except: pass
             except queue.Empty: break
-        time.sleep(0.1)  # brief settle for threads to notice stop
 
     def _emit(self,m):
         if self._scb: self._scb(m)
@@ -1134,8 +1077,7 @@ class Engine:
                 try: os.unlink(path)
                 except: pass
                 break
-            # PERF: put with timeout so stop() can unblock this thread
-            try: self._q.put(str(path),timeout=5)
+            try: self._q.put(str(path),timeout=120)
             except queue.Full:
                 try: os.unlink(path)
                 except: pass
@@ -1151,8 +1093,7 @@ class Engine:
             mode_disp=Path(path).stem.split('_')[1]
             self._prog(100); self._emit(f"playing  ·  {mode_disp.replace('pure','').strip()}")
             if self._playcb: self._playcb(mode_disp)
-            self._stop.clear()  # BUG FIX: clear before play so stop signal is fresh
-            play_wav_blocking(path,self._stop)
+            play_wav_blocking(path,self._stop); self._stop.clear()
             try: os.unlink(path)
             except: pass
 
@@ -1189,16 +1130,16 @@ ALL_MODES_LIST = [
 ]
 
 # ═══════════════════════════════════════════════════════════════
-#  PyAmby v1.0 GUI
+#  PyAmby  GUI
 # ═══════════════════════════════════════════════════════════════
 
 class PyAmby:
     def __init__(self):
         self.root=tk.Tk()
-        self.root.title('PyAmby v1.0')
+        self.root.title('PyAmby')
         self.root.configure(bg=BG)
-        self.root.geometry('620x560')
-        self.root.minsize(520,460)
+        self.root.geometry('620x510')
+        self.root.minsize(520,420)
 
         self.engine=Engine()
         self.engine.set_cbs(s=self._on_status,p=self._on_prog,play=self._on_play)
@@ -1220,7 +1161,7 @@ class PyAmby:
         hdr=tk.Frame(self.root,bg=BG,pady=7)
         hdr.pack(fill=tk.X,padx=14)
         tk.Label(hdr,text='PyAmby',font=('Courier',18,'bold'),fg=ACC,bg=BG).pack(side=tk.LEFT)
-        tk.Label(hdr,text='v1.0  ·  cosmic sound · offline · forever',
+        tk.Label(hdr,text='cosmic sound · offline · forever',
                  font=('Courier',7),fg=DIM,bg=BG).pack(side=tk.LEFT,padx=10,pady=4)
 
         tk.Frame(self.root,bg=SEP,height=1).pack(fill=tk.X)
@@ -1246,26 +1187,24 @@ class PyAmby:
         self._build_export(t2)
         self._build_source(t3)
 
-        # ── bottom tray (always visible: volume knob + status)
+        # ── bottom tray (always visible: volume + status)
         tk.Frame(self.root,bg=SEP,height=1).pack(fill=tk.X)
         tray=tk.Frame(self.root,bg=BG2,pady=5)
         tray.pack(fill=tk.X)
 
-        # Volume knob (canvas-drawn rotary) in the tray
         tk.Label(tray,text='vol',font=('Courier',7),fg=MUTED,bg=BG2).pack(side=tk.LEFT,padx=(10,2))
-        self._vol_knob=tk.Canvas(tray,width=30,height=30,bg=BG2,highlightthickness=0,cursor='hand2')
-        self._vol_knob.pack(side=tk.LEFT,padx=(0,2))
-        self._knob_drag_start=None
-        self._knob_drag_val=0.85
-        self._vol_knob.bind('<ButtonPress-1>',self._knob_press)
-        self._vol_knob.bind('<B1-Motion>',self._knob_drag)
-        self._vol_knob.bind('<ButtonRelease-1>',self._knob_release)
-        self._vol_knob.bind('<MouseWheel>',self._knob_scroll)
-        self._vol_knob.bind('<Button-4>',self._knob_scroll)
-        self._vol_knob.bind('<Button-5>',self._knob_scroll)
+        vol_sl=tk.Scale(tray,from_=0,to=100,orient='horizontal',
+                        variable=tk.IntVar(),bg=BG2,fg=MUTED,
+                        troughcolor=BG3,activebackground=ACC,
+                        highlightthickness=0,bd=0,sliderlength=14,width=6,
+                        showvalue=False,length=100,
+                        command=self._vol_change)
+        # bind DoubleVar → IntVar bridge
+        self._vol_ivar=tk.IntVar(value=85)
+        vol_sl.config(variable=self._vol_ivar)
+        vol_sl.pack(side=tk.LEFT)
         self._vol_pct=tk.Label(tray,text='85%',font=('Courier',7),fg=MUTED,bg=BG2,width=4)
-        self._vol_pct.pack(side=tk.LEFT,padx=(0,8))
-        self._draw_knob(0.85)
+        self._vol_pct.pack(side=tk.LEFT,padx=(2,8))
 
         sep2=tk.Frame(tray,bg=SEP,width=1); sep2.pack(side=tk.LEFT,fill=tk.Y,pady=2)
 
@@ -1276,73 +1215,11 @@ class PyAmby:
         if self._no_player:
             tk.Label(tray,text='⚠ no audio',font=('Courier',7),fg='#886600',bg=BG2).pack(side=tk.RIGHT,padx=10)
 
-    # ── volume knob drawing & interaction ───────────────────────
-
-    def _draw_knob(self,val):
-        c=self._vol_knob;c.delete('all')
-        cx,cy,r=15,15,11
-        # background circle
-        c.create_oval(cx-r,cy-r,cx+r,cy+r,fill=BG3,outline=DIM,width=1)
-        # arc fill (value)
-        import math
-        start_deg=220;span_deg=280
-        angle=start_deg-val*span_deg  # clockwise
-        # value arc
-        if val>0.001:
-            c.create_arc(cx-r+1,cy-r+1,cx+r-1,cy+r-1,
-                         start=start_deg,extent=-(val*span_deg),
-                         style='arc',outline=ACC2,width=2)
-        # indicator dot
-        rad=math.radians(angle)
-        dx=math.cos(rad)*7;dy=-math.sin(rad)*7
-        c.create_oval(cx+dx-2,cy+dy-2,cx+dx+2,cy+dy+2,fill=TEAL,outline='')
-
-    def _knob_press(self,e):
-        self._knob_drag_start=e.y
-        self._knob_drag_val=self._vol_var.get()
-
-    def _knob_drag(self,e):
-        if self._knob_drag_start is None: return
-        delta=(self._knob_drag_start-e.y)/120.0  # pixels to 0-1
-        new_val=max(0.,min(1.,self._knob_drag_val+delta))
-        self._set_vol(new_val)
-
-    def _knob_release(self,e): self._knob_drag_start=None
-
-    def _knob_scroll(self,e):
-        delta=0.
-        if hasattr(e,'delta') and e.delta: delta=e.delta/1200.
-        elif e.num==4: delta=0.05
-        elif e.num==5: delta=-0.05
-        new_val=max(0.,min(1.,self._vol_var.get()+delta))
-        self._set_vol(new_val)
-
-    def _set_vol(self,v):
-        self._vol_var.set(v); self.engine.set_vol(v)
-        pct=int(v*100)
-        self._vol_pct.config(text=f'{pct}%')
-        self._draw_knob(v)
-
     # ── PLAY tab ────────────────────────────────────────────────
 
     def _build_play(self,parent):
         inner=tk.Frame(parent,bg=BG,padx=16,pady=12)
         inner.pack(fill=tk.BOTH,expand=True)
-
-        # Volume knob also shown on play tab for quick access
-        vrow=tk.Frame(inner,bg=BG); vrow.pack(pady=(0,8))
-        tk.Label(vrow,text='volume',font=('Courier',8),fg=MUTED,bg=BG).pack(side=tk.LEFT,padx=(0,6))
-        self._play_vol_knob=tk.Canvas(vrow,width=34,height=34,bg=BG,highlightthickness=0,cursor='hand2')
-        self._play_vol_knob.pack(side=tk.LEFT)
-        self._play_vol_pct=tk.Label(vrow,text='85%',font=('Courier',9,'bold'),fg=BRIGHT,bg=BG,width=5)
-        self._play_vol_pct.pack(side=tk.LEFT,padx=(4,0))
-        self._play_vol_knob.bind('<ButtonPress-1>',self._pknob_press)
-        self._play_vol_knob.bind('<B1-Motion>',self._pknob_drag)
-        self._play_vol_knob.bind('<ButtonRelease-1>',self._pknob_release)
-        self._play_vol_knob.bind('<MouseWheel>',self._knob_scroll)
-        self._play_vol_knob.bind('<Button-4>',self._knob_scroll)
-        self._play_vol_knob.bind('<Button-5>',self._knob_scroll)
-        self._draw_play_knob(0.85)
 
         # AMBIENT
         self._amb_btn=tk.Button(inner,text='▶   AMBIENT',
@@ -1375,42 +1252,6 @@ class PyAmby:
                 command=lambda m=mode:self._tog_nature(m))
             btn.grid(row=idx//5,column=idx%5,padx=2,pady=2,sticky='nsew')
             self._nat_btns[mode]=btn
-
-    def _draw_play_knob(self,val):
-        import math
-        c=self._play_vol_knob;c.delete('all')
-        cx,cy,r=17,17,13
-        c.create_oval(cx-r,cy-r,cx+r,cy+r,fill=BG3,outline=DIM,width=1)
-        start_deg=220;span_deg=280
-        angle=start_deg-val*span_deg
-        if val>0.001:
-            c.create_arc(cx-r+1,cy-r+1,cx+r-1,cy+r-1,
-                         start=start_deg,extent=-(val*span_deg),
-                         style='arc',outline=ACC2,width=2)
-        rad=math.radians(angle)
-        dx=math.cos(rad)*9;dy=-math.sin(rad)*9
-        c.create_oval(cx+dx-2.5,cy+dy-2.5,cx+dx+2.5,cy+dy+2.5,fill=TEAL,outline='')
-
-    def _pknob_press(self,e):
-        self._knob_drag_start=e.y
-        self._knob_drag_val=self._vol_var.get()
-
-    def _pknob_drag(self,e):
-        if self._knob_drag_start is None: return
-        delta=(self._knob_drag_start-e.y)/120.0
-        new_val=max(0.,min(1.,self._knob_drag_val+delta))
-        self._set_vol_all(new_val)
-
-    def _pknob_release(self,e): self._knob_drag_start=None
-
-    def _set_vol_all(self,v):
-        """Update both knobs + engine vol simultaneously."""
-        self._vol_var.set(v); self.engine.set_vol(v)
-        pct=int(v*100)
-        self._vol_pct.config(text=f'{pct}%')
-        self._play_vol_pct.config(text=f'{pct}%')
-        self._draw_knob(v)
-        self._draw_play_knob(v)
 
     # ── EXPORT tab ──────────────────────────────────────────────
 
@@ -1490,8 +1331,7 @@ class PyAmby:
         self._exp_lbl=tk.Label(left,text='',font=('Courier',7),fg=MUTED,bg=BG)
         self._exp_lbl.grid(row=R,column=0,columnspan=2,pady=1); R+=1
 
-        # BUG FIX: store row index for open button so grid works on right parent
-        self._exp_open_row=R
+        # open folder button (hidden until export done)
         self._exp_open_btn=tk.Button(left,text='open folder',
             font=('Courier',7),fg=ACC,bg=BG,relief='flat',bd=0,cursor='hand2',
             command=self._open_folder)
@@ -1533,9 +1373,9 @@ class PyAmby:
         self._prog_bar.stop(); self._prog_bar.configure(mode='determinate',value=0)
 
     def _vol_change(self,val):
-        # Legacy slider handler (kept for compat, no longer wired to a slider widget)
         v=int(float(val)); pct=v/100.
-        self._set_vol_all(pct)
+        self._vol_var.set(pct); self.engine.set_vol(pct)
+        self._vol_pct.config(text=f'{v}%')
 
     # ── play callbacks ──────────────────────────────────────────
 
@@ -1585,7 +1425,7 @@ class PyAmby:
         self._exp_btn.config(state=tk.DISABLED,text='⏳  rendering …')
         self._exp_prog['value']=0
         self._exp_lbl.config(text='')
-        try: self._exp_open_btn.grid_forget()
+        try: self._exp_open_btn.pack_forget()
         except: pass
         threading.Thread(target=self._exp_worker,daemon=True).start()
 
@@ -1624,8 +1464,7 @@ class PyAmby:
             self._exp_lbl.config(text=f'error: {error}',fg=RED)
         else:
             self._exp_lbl.config(text=f'saved  ·  {Path(path).name}',fg=TEAL)
-            # BUG FIX: use grid with correct stored row index
-            self._exp_open_btn.grid(row=self._exp_open_row,column=0,columnspan=2,pady=3)
+            self._exp_open_btn.grid(row=10,column=0,columnspan=2,pady=3)
 
     def _open_folder(self):
         p=self._exp_last_path
