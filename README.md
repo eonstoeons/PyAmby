@@ -3,7 +3,7 @@
 """
 PyAmby  — cosmic algorithmic ambient player + exporter
 Pure Python stdlib. No dependencies. Offline. Forever.
-MIT License · 2025 FREEFLOW Project
+MIT License · 2026 FREEFLOW Project
 """
 
 import tkinter as tk
